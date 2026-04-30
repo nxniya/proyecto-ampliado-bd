@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"      # AMQP
+      - "15672:15672"    # Management UI  →  http://localhost:15672
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin123
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  producer:
+    build: ./producer
+    container_name: review_producer
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_USER: admin
+      RABBITMQ_PASS: admin123
+      RABBITMQ_QUEUE: reviews_queue
+      EVENTS_PER_SECOND: "3"
+    restart: unless-stopped
+
+  consumer:
+    build: ./consumer
+    container_name: review_consumer
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_USER: admin
+      RABBITMQ_PASS: admin123
+      RABBITMQ_QUEUE: reviews_queue
+      BATCH_SIZE: "100"
+      BATCH_TIMEOUT_SECONDS: "30"
+    restart: unless-stopped
+
+  dashboard:
+    build: ./dashboard
+    container_name: sentiment_dashboard
+    ports:
+      - "8501:8501"    # Streamlit  →  http://localhost:8501
+    env_file: .env
+    restart: unless-stopped
+
+volumes:
+  rabbitmq_data:

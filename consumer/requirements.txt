@@ -1,0 +1,3 @@
+pika
+azure-storage-blob
+python-dotenv

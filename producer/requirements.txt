@@ -1,0 +1,3 @@
+faker
+pika
+python-dotenv

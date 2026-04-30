@@ -1,0 +1,16 @@
+{
+    "name": "ds_SQLReviewsSentiment",
+    "type": "Microsoft.DataFactory/factories/datasets",
+    "properties": {
+        "description": "Tabla de Azure SQL con resultados de análisis de sentimiento por producto",
+        "linkedServiceName": {
+            "referenceName": "ls_AzureSQL",
+            "type": "LinkedServiceReference"
+        },
+        "type": "AzureSqlTable",
+        "typeProperties": {
+            "schema": "dbo",
+            "table": "reviews_sentiment"
+        }
+    }
+}

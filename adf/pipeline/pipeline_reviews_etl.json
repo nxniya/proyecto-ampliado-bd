@@ -1,0 +1,136 @@
+{
+    "name": "pipeline_reviews_etl",
+    "type": "Microsoft.DataFactory/factories/pipelines",
+    "properties": {
+        "description": "Pipeline principal del proyecto SentimentFlow. Se activa cuando el consumer sube un nuevo fichero .jsonl al contenedor 'raw-reviews'. Ejecuta el notebook de Databricks para calcular sentimiento y copiar resultados a Azure SQL.",
+        "parameters": {
+            "blobFileName": {
+                "type": "string",
+                "description": "Nombre del fichero .jsonl recibido del trigger de Storage Events"
+            }
+        },
+        "activities": [
+            {
+                "name": "AnalizarSentimientoDatabricks",
+                "description": "Ejecuta el notebook de Databricks que lee el lote raw, aplica análisis de sentimiento (VADER) y escribe Parquet en la zona processed.",
+                "type": "DatabricksNotebook",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "0.01:00:00",
+                    "retry": 1,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false
+                },
+                "linkedServiceName": {
+                    "referenceName": "ls_AzureDatabricks",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "notebookPath": "/Shared/SentimentFlow/01_sentiment_analysis",
+                    "baseParameters": {
+                        "raw_container": "raw-reviews",
+                        "processed_container": "processed-reviews",
+                        "input_file": {
+                            "value": "@pipeline().parameters.blobFileName",
+                            "type": "Expression"
+                        },
+                        "run_date": {
+                            "value": "@formatDateTime(utcnow(), 'yyyy-MM-dd')",
+                            "type": "Expression"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "CopiarResultadosSQL",
+                "description": "Copia los datos procesados (Parquet) desde Blob Storage a la tabla reviews_sentiment de Azure SQL Database.",
+                "type": "Copy",
+                "dependsOn": [
+                    {
+                        "activity": "AnalizarSentimientoDatabricks",
+                        "dependencyConditions": ["Succeeded"]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.01:00:00",
+                    "retry": 2,
+                    "retryIntervalInSeconds": 30
+                },
+                "typeProperties": {
+                    "source": {
+                        "type": "ParquetSource",
+                        "storeSettings": {
+                            "type": "AzureBlobStorageReadSettings",
+                            "recursive": false,
+                            "wildcardFileName": "*.parquet"
+                        }
+                    },
+                    "sink": {
+                        "type": "AzureSqlSink",
+                        "writeBehavior": "insert",
+                        "sqlWriterUseTableLock": false,
+                        "tableOption": "autoCreate"
+                    },
+                    "enableStaging": false,
+                    "translator": {
+                        "type": "TabularTranslator",
+                        "typeConversion": true,
+                        "typeConversionSettings": {
+                            "allowDataTruncation": true,
+                            "treatBooleanAsNumber": false
+                        }
+                    }
+                },
+                "inputs": [
+                    {
+                        "referenceName": "ds_BlobProcessedReviews",
+                        "type": "DatasetReference"
+                    }
+                ],
+                "outputs": [
+                    {
+                        "referenceName": "ds_SQLReviewsSentiment",
+                        "type": "DatasetReference"
+                    }
+                ]
+            },
+            {
+                "name": "NotificarError",
+                "description": "En caso de fallo, registra el error en una tabla de auditoría de SQL.",
+                "type": "SqlServerStoredProcedure",
+                "dependsOn": [
+                    {
+                        "activity": "AnalizarSentimientoDatabricks",
+                        "dependencyConditions": ["Failed"]
+                    }
+                ],
+                "linkedServiceName": {
+                    "referenceName": "ls_AzureSQL",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "storedProcedureName": "[dbo].[sp_log_pipeline_error]",
+                    "storedProcedureParameters": {
+                        "pipeline_name": {
+                            "value": "@pipeline().Pipeline",
+                            "type": "String"
+                        },
+                        "run_id": {
+                            "value": "@pipeline().RunId",
+                            "type": "String"
+                        },
+                        "error_message": {
+                            "value": "@activity('AnalizarSentimientoDatabricks').error.message",
+                            "type": "String"
+                        },
+                        "failed_at": {
+                            "value": "@utcnow()",
+                            "type": "DateTime"
+                        }
+                    }
+                }
+            }
+        ],
+        "annotations": ["SentimentFlow", "BigData", "RabbitMQ"]
+    }
+}

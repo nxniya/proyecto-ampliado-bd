@@ -1,0 +1,15 @@
+{
+    "name": "ls_AzureBlobStorage",
+    "type": "Microsoft.DataFactory/factories/linkedservices",
+    "properties": {
+        "description": "Conexión al Azure Blob Storage donde el consumer deposita los lotes de reseñas",
+        "type": "AzureBlobStorage",
+        "typeProperties": {
+            "connectionString": {
+                "type": "AzureKeyVaultSecret",
+                "store": { "referenceName": "ls_AzureKeyVault", "type": "LinkedServiceReference" },
+                "secretName": "BlobStorageConnectionString"
+            }
+        }
+    }
+}

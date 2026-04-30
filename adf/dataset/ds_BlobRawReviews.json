@@ -1,0 +1,25 @@
+{
+    "name": "ds_BlobRawReviews",
+    "type": "Microsoft.DataFactory/factories/datasets",
+    "properties": {
+        "description": "Ficheros JSON Lines depositados por el consumer en la zona raw",
+        "linkedServiceName": {
+            "referenceName": "ls_AzureBlobStorage",
+            "type": "LinkedServiceReference"
+        },
+        "type": "Json",
+        "typeProperties": {
+            "location": {
+                "type": "AzureBlobStorageLocation",
+                "container": "raw-reviews",
+                "fileName": {
+                    "value": "@dataset().fileName",
+                    "type": "Expression"
+                }
+            }
+        },
+        "parameters": {
+            "fileName": { "type": "string" }
+        }
+    }
+}

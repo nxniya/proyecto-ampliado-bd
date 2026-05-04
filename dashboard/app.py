@@ -1,71 +1,52 @@
 """
 app.py — Dashboard Streamlit · SentimentFlow
-Visualiza en tiempo casi-real el análisis de sentimiento de reseñas de productos
-procesadas por Azure Databricks y almacenadas en Azure SQL Database.
-
-Responsable: Persona 2
+Visualiza el análisis de sentimiento de reseñas almacenadas en PostgreSQL.
 """
 
 import os
-import struct
 
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
-import pyodbc
+import psycopg2
 import streamlit as st
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ─── Configuración de página ──────────────────────────────────────────────────
 st.set_page_config(
     page_title="SentimentFlow Dashboard",
     page_icon="📊",
     layout="wide",
 )
 
-# ─── Conexión a Azure SQL ──────────────────────────────────────────────────────
+# ─── Conexión a PostgreSQL ─────────────────────────────────────────────────────
 @st.cache_resource(ttl=60)
 def get_connection():
-    server   = os.environ["AZURE_SQL_SERVER"]
-    database = os.environ["AZURE_SQL_DATABASE"]
-    username = os.environ["AZURE_SQL_USER"]
-    password = os.environ["AZURE_SQL_PASSWORD"]
-
-    conn_str = (
-        f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-        f"SERVER={server};"
-        f"DATABASE={database};"
-        f"UID={username};"
-        f"PWD={password};"
-        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+    return psycopg2.connect(
+        host=os.environ["POSTGRES_HOST"],
+        port=int(os.environ.get("POSTGRES_PORT", "5432")),
+        dbname=os.environ["POSTGRES_DB"],
+        user=os.environ["POSTGRES_USER"],
+        password=os.environ["POSTGRES_PASSWORD"],
     )
-    return pyodbc.connect(conn_str)
 
 
 @st.cache_data(ttl=30)
 def load_by_product() -> pd.DataFrame:
     conn = get_connection()
-    return pd.read_sql(
-        "SELECT * FROM dbo.agg_by_product ORDER BY total_reviews DESC", conn
-    )
+    return pd.read_sql("SELECT * FROM agg_by_product ORDER BY total_reviews DESC", conn)
 
 
 @st.cache_data(ttl=30)
 def load_timeseries() -> pd.DataFrame:
     conn = get_connection()
-    return pd.read_sql(
-        "SELECT * FROM dbo.agg_timeseries ORDER BY hour_bucket", conn
-    )
+    return pd.read_sql("SELECT * FROM agg_timeseries ORDER BY hour_bucket", conn)
 
 
 @st.cache_data(ttl=30)
 def load_by_country() -> pd.DataFrame:
     conn = get_connection()
-    return pd.read_sql(
-        "SELECT * FROM dbo.agg_by_country ORDER BY total_reviews DESC", conn
-    )
+    return pd.read_sql("SELECT * FROM agg_by_country ORDER BY total_reviews DESC", conn)
 
 
 @st.cache_data(ttl=30)
@@ -73,12 +54,12 @@ def load_recent(n: int = 200) -> pd.DataFrame:
     conn = get_connection()
     return pd.read_sql(
         f"""
-        SELECT TOP {n}
-            product_name, category, rating,
-            sentiment_score, sentiment_label,
-            country, event_ts
-        FROM dbo.reviews_sentiment
+        SELECT product_name, category, rating,
+               sentiment_score, sentiment_label,
+               country, event_ts
+        FROM reviews_sentiment
         ORDER BY processed_at DESC
+        LIMIT {n}
         """,
         conn,
     )
@@ -86,22 +67,22 @@ def load_recent(n: int = 200) -> pd.DataFrame:
 
 # ─── Layout ───────────────────────────────────────────────────────────────────
 st.title("📊 SentimentFlow — Análisis de Sentimiento en Tiempo Real")
-st.caption("Pipeline: RabbitMQ → Azure Blob Storage → Azure Data Factory → Databricks → Azure SQL")
+st.caption("Pipeline: RabbitMQ → MinIO → Airflow → PySpark (VADER) → PostgreSQL")
 
 try:
-    df_product   = load_by_product()
-    df_ts        = load_timeseries()
-    df_country   = load_by_country()
-    df_recent    = load_recent()
+    df_product = load_by_product()
+    df_ts      = load_timeseries()
+    df_country = load_by_country()
+    df_recent  = load_recent()
     data_ok = True
 except Exception as exc:
-    st.error(f"No se pudo conectar a Azure SQL: {exc}")
-    st.info("Asegúrate de que `.env` tiene las credenciales correctas y el servidor es accesible.")
+    st.error(f"No se pudo conectar a PostgreSQL: {exc}")
+    st.info("Asegúrate de que `.env` tiene las credenciales correctas y PostgreSQL está en marcha.")
     data_ok = False
 
 if data_ok:
     # ── KPIs ──────────────────────────────────────────────────────────────────
-    total    = int(df_product["total_reviews"].sum())
+    total    = int(df_product["total_reviews"].sum()) if not df_product.empty else 0
     avg_sent = float(df_recent["sentiment_score"].mean()) if not df_recent.empty else 0.0
     pct_pos  = (
         int((df_recent["sentiment_label"] == "Positivo").sum()) / len(df_recent) * 100
@@ -121,18 +102,19 @@ if data_ok:
 
     with col_left:
         st.subheader("Reseñas por producto")
-        fig_bar = px.bar(
-            df_product.head(8),
-            x="product_name", y="total_reviews",
-            color="avg_sentiment",
-            color_continuous_scale="RdYlGn",
-            range_color=[-1, 1],
-            labels={"product_name": "Producto", "total_reviews": "Reseñas",
-                    "avg_sentiment": "Sentimiento medio"},
-            text="total_reviews",
-        )
-        fig_bar.update_layout(xaxis_tickangle=-25, coloraxis_showscale=True)
-        st.plotly_chart(fig_bar, use_container_width=True)
+        if not df_product.empty:
+            fig_bar = px.bar(
+                df_product.head(8),
+                x="product_name", y="total_reviews",
+                color="avg_sentiment",
+                color_continuous_scale="RdYlGn",
+                range_color=[-1, 1],
+                labels={"product_name": "Producto", "total_reviews": "Reseñas",
+                        "avg_sentiment": "Sentimiento medio"},
+                text="total_reviews",
+            )
+            fig_bar.update_layout(xaxis_tickangle=-25, coloraxis_showscale=True)
+            st.plotly_chart(fig_bar, use_container_width=True)
 
     with col_right:
         st.subheader("Distribución de sentimiento")
@@ -189,26 +171,18 @@ if data_ok:
 
     with col_table:
         st.subheader("Últimas reseñas procesadas")
-        sentiment_colors = {
-            "Positivo": "background-color: #d4edda",
-            "Negativo": "background-color: #f8d7da",
-            "Neutro":   "background-color: #fff3cd",
-        }
-
-        def color_row(row):
-            return [sentiment_colors.get(row["sentiment_label"], "")] * len(row)
-
-        st.dataframe(
-            df_recent[["product_name", "rating", "sentiment_label", "sentiment_score", "country"]]
-            .rename(columns={
-                "product_name":    "Producto",
-                "rating":          "Rating",
-                "sentiment_label": "Sentimiento",
-                "sentiment_score": "Score",
-                "country":         "País",
-            }),
-            use_container_width=True,
-            height=380,
-        )
+        if not df_recent.empty:
+            st.dataframe(
+                df_recent[["product_name", "rating", "sentiment_label", "sentiment_score", "country"]]
+                .rename(columns={
+                    "product_name":    "Producto",
+                    "rating":          "Rating",
+                    "sentiment_label": "Sentimiento",
+                    "sentiment_score": "Score",
+                    "country":         "País",
+                }),
+                use_container_width=True,
+                height=380,
+            )
 
     st.caption("🔄 Datos actualizados cada 30 segundos. Recarga la página para ver los últimos.")

@@ -1,3 +1,4 @@
 pika
-azure-storage-blob
+boto3
+requests
 python-dotenv

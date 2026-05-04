@@ -1,14 +1,12 @@
 """
-consumer.py — Consumidor RabbitMQ → Azure Blob Storage.
+consumer.py — Consumidor RabbitMQ → MinIO (S3-compatible).
 
 Lee mensajes de la cola 'reviews_queue', los acumula en un buffer
 y cuando se alcanza BATCH_SIZE mensajes (o BATCH_TIMEOUT_SECONDS segundos)
-sube un fichero JSON Lines a Azure Blob Storage en el contenedor 'raw-reviews'.
+sube un fichero JSON Lines a MinIO en el bucket 'raw-reviews'.
 
-Ese fichero activa automáticamente el pipeline de Azure Data Factory
-mediante un Storage Event Trigger configurado en ADF.
-
-Responsable: Persona 1
+Tras cada subida exitosa activa el DAG de Airflow mediante su REST API,
+replicando el comportamiento del Storage Event Trigger de Azure Data Factory.
 """
 
 import json
@@ -20,7 +18,9 @@ from datetime import datetime, timezone
 from io import BytesIO
 
 import pika
-from azure.storage.blob import BlobServiceClient
+import boto3
+import requests
+from botocore.client import Config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,40 +29,53 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─── Configuración ────────────────────────────────────────────────────────────
-RABBITMQ_HOST    = os.getenv("RABBITMQ_HOST", "localhost")
-RABBITMQ_USER    = os.getenv("RABBITMQ_USER", "admin")
-RABBITMQ_PASS    = os.getenv("RABBITMQ_PASS", "admin123")
-RABBITMQ_QUEUE   = os.getenv("RABBITMQ_QUEUE", "reviews_queue")
-BATCH_SIZE       = int(os.getenv("BATCH_SIZE", "100"))
-BATCH_TIMEOUT    = int(os.getenv("BATCH_TIMEOUT_SECONDS", "30"))
+RABBITMQ_HOST  = os.getenv("RABBITMQ_HOST", "localhost")
+RABBITMQ_USER  = os.getenv("RABBITMQ_USER", "admin")
+RABBITMQ_PASS  = os.getenv("RABBITMQ_PASS", "admin123")
+RABBITMQ_QUEUE = os.getenv("RABBITMQ_QUEUE", "reviews_queue")
+BATCH_SIZE     = int(os.getenv("BATCH_SIZE", "100"))
+BATCH_TIMEOUT  = int(os.getenv("BATCH_TIMEOUT_SECONDS", "30"))
 
-AZURE_CONN_STR   = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
-AZURE_CONTAINER  = os.getenv("AZURE_CONTAINER_RAW", "raw-reviews")
+MINIO_ENDPOINT  = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+MINIO_BUCKET_RAW = os.getenv("MINIO_BUCKET_RAW", "raw-reviews")
+
+AIRFLOW_URL  = os.getenv("AIRFLOW_URL", "http://airflow-webserver:8080")
+AIRFLOW_USER = os.getenv("AIRFLOW_USER", "airflow")
+AIRFLOW_PASS = os.getenv("AIRFLOW_PASS", "airflow")
+AIRFLOW_DAG  = "reviews_etl"
 
 
 # ─── Gestor de lotes (thread-safe) ────────────────────────────────────────────
 class BatchUploader:
-    """Acumula mensajes y los sube a Blob Storage en lotes."""
+    """Acumula mensajes y los sube a MinIO en lotes."""
 
     def __init__(self):
-        self._buffer: list[dict] = []
+        self._buffer: list = []
         self._lock = threading.Lock()
         self._last_flush = time.monotonic()
 
-        if not AZURE_CONN_STR:
-            raise EnvironmentError(
-                "AZURE_STORAGE_CONNECTION_STRING no está definida. "
-                "Copia .env.example a .env y rellena los valores."
-            )
-        self._blob_client = BlobServiceClient.from_connection_string(AZURE_CONN_STR)
-        # Crea el contenedor si no existe
-        container = self._blob_client.get_container_client(AZURE_CONTAINER)
-        if not container.exists():
-            container.create_container()
-            log.info("Contenedor '%s' creado.", AZURE_CONTAINER)
+        self._s3 = boto3.client(
+            "s3",
+            endpoint_url=MINIO_ENDPOINT,
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            config=Config(signature_version="s3v4"),
+            region_name="us-east-1",
+        )
+        self._ensure_bucket()
+
+    def _ensure_bucket(self):
+        try:
+            self._s3.create_bucket(Bucket=MINIO_BUCKET_RAW)
+            log.info("Bucket '%s' creado.", MINIO_BUCKET_RAW)
+        except self._s3.exceptions.BucketAlreadyOwnedByYou:
+            pass
+        except Exception:
+            pass  # El bucket puede existir ya (de minio-init)
 
     def add(self, message: dict, ack_fn):
-        """Añade un mensaje al buffer. Hace flush si se cumple algún criterio."""
         with self._lock:
             self._buffer.append((message, ack_fn))
             should_flush = (
@@ -81,25 +94,50 @@ class BatchUploader:
             self._last_flush = time.monotonic()
 
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        blob_name = f"batch_{ts}_{len(batch):04d}.jsonl"
+        object_name = f"batch_{ts}_{len(batch):04d}.jsonl"
 
-        # JSON Lines: una reseña por línea
         jsonl_content = "\n".join(
             json.dumps(msg, ensure_ascii=False) for msg, _ in batch
         ).encode("utf-8")
 
         try:
-            blob = self._blob_client.get_blob_client(
-                container=AZURE_CONTAINER, blob=blob_name
+            self._s3.put_object(
+                Bucket=MINIO_BUCKET_RAW,
+                Key=object_name,
+                Body=BytesIO(jsonl_content),
+                ContentType="application/x-ndjson",
             )
-            blob.upload_blob(BytesIO(jsonl_content), overwrite=True)
-            log.info("✓ Subido '%s' (%d reseñas, %.1f KB)",
-                     blob_name, len(batch), len(jsonl_content) / 1024)
+            log.info(
+                "✓ Subido '%s' a MinIO (%d reseñas, %.1f KB)",
+                object_name, len(batch), len(jsonl_content) / 1024,
+            )
             # ACK a RabbitMQ solo tras confirmar la subida
             for _, ack_fn in batch:
                 ack_fn()
-        except Exception as exc:  # noqa: BLE001
-            log.error("Error al subir '%s': %s. Mensajes NO confirmados.", blob_name, exc)
+
+            self._trigger_airflow(object_name)
+
+        except Exception as exc:
+            log.error("Error al subir '%s': %s. Mensajes NO confirmados.", object_name, exc)
+
+    def _trigger_airflow(self, filename: str):
+        """Activa el DAG de Airflow pasando el nombre del fichero como parámetro."""
+        url = f"{AIRFLOW_URL}/api/v1/dags/{AIRFLOW_DAG}/dagRuns"
+        try:
+            resp = requests.post(
+                url,
+                json={"conf": {"input_file": filename}},
+                auth=(AIRFLOW_USER, AIRFLOW_PASS),
+                timeout=10,
+            )
+            resp.raise_for_status()
+            log.info("DAG '%s' activado para: %s", AIRFLOW_DAG, filename)
+        except Exception as exc:
+            log.warning(
+                "No se pudo activar el DAG de Airflow: %s. "
+                "El fichero está en MinIO y puede procesarse manualmente.",
+                exc,
+            )
 
 
 # ─── Conexión RabbitMQ ─────────────────────────────────────────────────────────
@@ -142,8 +180,6 @@ def main():
     connection = connect_rabbitmq()
     channel = connection.channel()
     channel.queue_declare(queue=RABBITMQ_QUEUE, durable=True)
-
-    # Procesar un mensaje a la vez (prefetch=1 → fair dispatch)
     channel.basic_qos(prefetch_count=1)
 
     def on_message(ch, method, _properties, body):
@@ -160,8 +196,10 @@ def main():
         uploader.add(message, ack)
 
     channel.basic_consume(queue=RABBITMQ_QUEUE, on_message_callback=on_message)
-    log.info("Esperando mensajes en '%s'. Lote: %d msgs / %d s…",
-             RABBITMQ_QUEUE, BATCH_SIZE, BATCH_TIMEOUT)
+    log.info(
+        "Esperando mensajes en '%s'. Lote: %d msgs / %d s…",
+        RABBITMQ_QUEUE, BATCH_SIZE, BATCH_TIMEOUT,
+    )
     try:
         channel.start_consuming()
     except KeyboardInterrupt:

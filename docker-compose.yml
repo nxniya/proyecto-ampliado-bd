@@ -2,12 +2,13 @@ version: '3.8'
 
 services:
 
+  # ─── Mensajería ───────────────────────────────────────────────────────────────
   rabbitmq:
     image: rabbitmq:3.12-management
     container_name: rabbitmq
     ports:
-      - "5672:5672"      # AMQP
-      - "15672:15672"    # Management UI  →  http://localhost:15672
+      - "5672:5672"       # AMQP
+      - "15672:15672"     # Management UI → http://localhost:15672
     environment:
       RABBITMQ_DEFAULT_USER: admin
       RABBITMQ_DEFAULT_PASS: admin123
@@ -19,6 +20,157 @@ services:
       timeout: 5s
       retries: 5
 
+  # ─── Almacenamiento objeto — reemplaza Azure Blob Storage ─────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"       # S3 API
+      - "9001:9001"       # Web console → http://localhost:9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Crea los buckets raw-reviews y processed-reviews al arrancar
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+    entrypoint: ["/bin/sh", "-c",
+      "mc alias set local http://minio:9000 $$MINIO_ACCESS_KEY $$MINIO_SECRET_KEY &&
+       mc mb --ignore-existing local/raw-reviews &&
+       mc mb --ignore-existing local/processed-reviews &&
+       echo 'Buckets listos.'"]
+
+  # ─── Base de datos — reemplaza Azure SQL Database ─────────────────────────────
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-reviewsdb}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/00_airflow_db.sql:/docker-entrypoint-initdb.d/00_airflow_db.sql
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-reviewsdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Orquestación — reemplaza Azure Data Factory ──────────────────────────────
+  # Inicializa la base de datos de Airflow y crea el usuario admin
+  airflow-init:
+    build: ./airflow
+    container_name: airflow_init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__WEBSERVER__SECRET_KEY: sentimentflow-secret-key
+    entrypoint: ["/bin/bash", "-c",
+      "airflow db migrate &&
+       airflow users create --role Admin --username airflow --password airflow
+         --firstname Air --lastname Flow --email airflow@sentimentflow.local || true"]
+
+  airflow-webserver:
+    build: ./airflow
+    container_name: airflow_webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    env_file: .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+      AIRFLOW__WEBSERVER__SECRET_KEY: sentimentflow-secret-key
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET_RAW: raw-reviews
+      MINIO_BUCKET_PROCESSED: processed-reviews
+      POSTGRES_HOST: postgres
+    ports:
+      - "8080:8080"       # UI → http://localhost:8080  (airflow / airflow)
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./spark:/opt/spark
+      - airflow_logs:/opt/airflow/logs
+    command: webserver
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  airflow-scheduler:
+    build: ./airflow
+    container_name: airflow_scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    env_file: .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__WEBSERVER__SECRET_KEY: sentimentflow-secret-key
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET_RAW: raw-reviews
+      MINIO_BUCKET_PROCESSED: processed-reviews
+      POSTGRES_HOST: postgres
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./spark:/opt/spark
+      - airflow_logs:/opt/airflow/logs
+    command: scheduler
+
+  # ─── Spark interactivo — reemplaza Azure Databricks ───────────────────────────
+  jupyter:
+    build: ./notebooks
+    container_name: jupyter_spark
+    depends_on:
+      minio:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      JUPYTER_ENABLE_LAB: "yes"
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET_RAW: raw-reviews
+      MINIO_BUCKET_PROCESSED: processed-reviews
+      POSTGRES_HOST: postgres
+    ports:
+      - "8888:8888"       # JupyterLab → http://localhost:8888 (sin contraseña)
+    volumes:
+      - ./notebooks:/home/jovyan/work
+    command: start-notebook.sh --NotebookApp.token='' --NotebookApp.password=''
+
+  # ─── Ingesta ───────────────────────────────────────────────────────────────────
   producer:
     build: ./producer
     container_name: review_producer
@@ -40,6 +192,10 @@ services:
     depends_on:
       rabbitmq:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      airflow-webserver:
+        condition: service_healthy
     env_file: .env
     environment:
       RABBITMQ_HOST: rabbitmq
@@ -48,15 +204,31 @@ services:
       RABBITMQ_QUEUE: reviews_queue
       BATCH_SIZE: "100"
       BATCH_TIMEOUT_SECONDS: "30"
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET_RAW: raw-reviews
+      AIRFLOW_URL: http://airflow-webserver:8080
+      AIRFLOW_USER: airflow
+      AIRFLOW_PASS: airflow
     restart: unless-stopped
 
+  # ─── Visualización ─────────────────────────────────────────────────────────────
   dashboard:
     build: ./dashboard
     container_name: sentiment_dashboard
-    ports:
-      - "8501:8501"    # Streamlit  →  http://localhost:8501
+    depends_on:
+      postgres:
+        condition: service_healthy
     env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+    ports:
+      - "8501:8501"       # Streamlit → http://localhost:8501
     restart: unless-stopped
 
 volumes:
   rabbitmq_data:
+  minio_data:
+  postgres_data:
+  airflow_logs:

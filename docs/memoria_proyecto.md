@@ -10,7 +10,7 @@
 
 El objetivo de SentimentFlow es construir un **pipeline de procesamiento de datos en tiempo casi-real** que capture reseñas de productos de una plataforma de e-commerce, analice automáticamente su sentimiento (positivo / neutro / negativo) y presente los resultados en un dashboard interactivo actualizado cada 30 segundos.
 
-El proyecto demuestra la integración de herramientas de mensajería orientada a eventos (**RabbitMQ**) con el ecosistema de datos de **Microsoft Azure** (Data Factory, Databricks, Blob Storage, SQL Database), formando una arquitectura Lambda simplificada.
+El proyecto demuestra la integración de herramientas de mensajería orientada a eventos (**RabbitMQ**) con una pila de Big Data open-source completamente desplegable en local mediante Docker, formando una arquitectura Lambda simplificada.
 
 ---
 
@@ -18,47 +18,66 @@ El proyecto demuestra la integración de herramientas de mensajería orientada a
 
 ### RabbitMQ
 
-RabbitMQ es un broker de mensajería AMQP de código abierto, ampliamente utilizado en arquitecturas de Big Data para desacoplar productores de consumidores y garantizar la entrega de mensajes incluso ante caídas temporales de algún componente.
+RabbitMQ es un broker de mensajería AMQP de código abierto, ampliamente utilizado en arquitecturas de Big Data para desacoplar productores de consumidores y garantizar la entrega de mensajes incluso ante caídas temporales.
 
-**Justificación de elección:**
-- Soporte nativo de colas durables y confirmaciones de entrega (ACK), lo que garantiza que ninguna reseña se pierda si el consumer falla.
-- Protocolo AMQP estándar con clientes Python maduros (`pika`).
-- Interfaz de administración web que permite monitorizar la profundidad de las colas en tiempo real.
-- Relevante en el contexto Big Data como capa de ingesta ante picos de carga (buffer ante ráfagas de eventos).
+**Justificación:**
+- Colas **durables** y mensajes **persistentes**: no se pierde ninguna reseña si el broker se reinicia.
+- ACK manual: el consumer solo confirma el mensaje cuando la subida a MinIO ha sido exitosa, garantizando semántica *at-least-once*.
+- Interfaz de administración web para monitorizar la profundidad de las colas en tiempo real.
 
-### Azure Data Factory (ADF)
+### MinIO (reemplaza Azure Blob Storage)
 
-ADF es el servicio de orquestación ETL/ELT de Azure. Permite definir **pipelines** visuales que combinan actividades (notebooks, copias de datos, procedimientos almacenados) y dispararlos con **triggers** basados en eventos de almacenamiento.
+MinIO es un servidor de almacenamiento de objetos compatible con la API de Amazon S3. Se despliega en un contenedor Docker y actúa como Data Lake local.
 
-**Justificación de elección:**
-- Orquestación serverless: no requiere gestionar infraestructura de scheduler.
-- Storage Event Trigger: reacciona de forma nativa cuando el consumer deposita un nuevo fichero en Blob Storage.
-- Integración directa con Azure Databricks como actividad del pipeline.
-- Reintento automático de actividades fallidas y registro de errores.
+**Justificación:**
+- API S3-compatible: el código Python usa `boto3` exactamente igual que usaría el SDK de AWS o Azure Blob Storage.
+- Interfaz web para explorar los buckets y ficheros subidos.
+- Sin coste, sin dependencias de red externa, reproducible en cualquier máquina.
+- Escalable: en producción se podría sustituir por AWS S3 o Azure Blob Storage cambiando solo el endpoint.
 
-### Azure Databricks
+### Apache Airflow (reemplaza Azure Data Factory)
 
-Databricks es una plataforma de análisis de datos basada en Apache Spark. Se usa aquí para el procesamiento distribuido de los lotes de reseñas y la ejecución del modelo de análisis de sentimiento.
+Airflow es el estándar de facto para la orquestación de pipelines de datos. Define los flujos como DAGs (Directed Acyclic Graphs) en Python.
 
-**Justificación de elección:**
-- PySpark permite escalar el procesamiento a millones de reseñas si fuera necesario.
-- VADER (Valence Aware Dictionary and Sentiment Reasoner) es un modelo de análisis de sentimiento pre-entrenado, ligero y efectivo para textos cortos en idiomas con recursos léxicos limitados.
-- Los notebooks son reproducibles y auditables.
+**Justificación:**
+- DAGs como código: reproducibles, versionables con git, testables.
+- El consumer activa el DAG mediante la **REST API de Airflow** justo al subir cada fichero, replicando el comportamiento event-driven del Storage Event Trigger de ADF.
+- Interfaz web con historial de ejecuciones, logs por tarea y reintentos configurables.
+- Sin coste, sin dependencias de red externa.
+
+### Apache Spark / JupyterLab (reemplaza Azure Databricks)
+
+PySpark se ejecuta en modo local dentro del contenedor de Airflow. JupyterLab proporciona un entorno de notebooks interactivo equivalente al de Databricks.
+
+**Justificación:**
+- PySpark local permite procesar los lotes de reseñas con el mismo API que usaría un clúster Databricks a escala.
+- VADER (Valence Aware Dictionary and Sentiment Reasoner): modelo NLP preentrenado, ligero y sin coste de API, adecuado para textos cortos.
+- Los notebooks son reproducibles y permiten exploración interactiva de los datos.
+
+### PostgreSQL (reemplaza Azure SQL Database)
+
+PostgreSQL es el sistema de gestión de bases de datos relacionales open-source más completo.
+
+**Justificación:**
+- DDL estándar SQL compatible con la mayoría de herramientas de visualización.
+- `psycopg2` es el driver Python de referencia, ligero y sin dependencias externas.
+- Sin coste, sin límites de consulta, sin necesidad de driver ODBC propietario.
+- El esquema de tablas (`reviews_sentiment`, `agg_*`) es idéntico al diseñado para Azure SQL, solo cambia la sintaxis T-SQL → PostgreSQL.
 
 ---
 
 ## 3. Arquitectura y flujo de datos
 
 ```
-[Python Producer]  →  RabbitMQ  →  [Python Consumer]  →  Azure Blob Storage (raw)
+[Python Producer]  →  RabbitMQ  →  [Python Consumer]  →  MinIO (raw-reviews/*.jsonl)
                                                                   ↓
-                                                   ADF Storage Event Trigger
+                                                   Consumer llama REST API Airflow
                                                                   ↓
-                                           Azure Data Factory Pipeline
-                                           ① DatabricksNotebook (VADER)
-                                           ② Copy Activity → Azure SQL
+                                           Apache Airflow DAG: reviews_etl
+                                           ① Task: sentiment_analysis (PySpark)
+                                           ② Task: aggregations (PySpark)
                                                                   ↓
-                                                   Azure SQL Database
+                                                   PostgreSQL Database
                                                                   ↓
                                                   Streamlit Dashboard
 ```
@@ -67,40 +86,38 @@ Databricks es una plataforma de análisis de datos basada en Apache Spark. Se us
 
 1. El **Producer** genera reseñas sintéticas con datos aleatorios (producto, valoración, texto, país, timestamp) y las publica en la cola `reviews_queue` de RabbitMQ a razón de 3 msg/s.
 
-2. **RabbitMQ** almacena los mensajes de forma durable hasta que el consumer los consume y confirma (ACK). La cola actúa como buffer ante posibles latencias en la subida a Azure.
+2. **RabbitMQ** almacena los mensajes de forma durable hasta que el consumer los consume y confirma (ACK). La cola actúa como buffer ante posibles latencias en la subida a MinIO.
 
-3. El **Consumer** lee mensajes de la cola con `prefetch=1` (fair dispatch), los acumula en un buffer thread-safe y cuando se alcanzan 100 mensajes (o 30 segundos de espera) sube un fichero `.jsonl` al contenedor `raw-reviews` de Azure Blob Storage. Solo hace ACK a RabbitMQ tras confirmar que la subida ha sido exitosa.
+3. El **Consumer** lee mensajes de la cola con `prefetch=1` (fair dispatch), los acumula en un buffer thread-safe y cuando se alcanzan 100 mensajes (o 30 segundos de espera) sube un fichero `.jsonl` al bucket `raw-reviews` de MinIO usando `boto3`. Solo hace ACK a RabbitMQ tras confirmar que la subida ha sido exitosa. Acto seguido, llama a la REST API de Airflow para activar el DAG `reviews_etl` pasando el nombre del fichero como parámetro.
 
-4. El **Storage Event Trigger** de Azure Data Factory detecta la creación del nuevo fichero y lanza el pipeline `pipeline_reviews_etl`, pasando el nombre del fichero como parámetro.
+4. **Apache Airflow** recibe la llamada y crea una nueva ejecución del DAG, ejecutando secuencialmente:
+   - **Task 1** (`sentiment_analysis`): descarga el `.jsonl` de MinIO a un directorio temporal, lo lee con PySpark, limpia los textos mediante UDFs, aplica VADER para calcular el score de sentimiento, escribe los resultados en PostgreSQL (`reviews_sentiment`) y sube el Parquet resultante al bucket `processed-reviews` de MinIO.
+   - **Task 2** (`aggregations`): lee todos los registros de `reviews_sentiment` desde PostgreSQL, calcula agregados por producto, por hora y por país usando PySpark, y actualiza las tablas `agg_by_product`, `agg_timeseries` y `agg_by_country`.
 
-5. **Azure Data Factory** ejecuta secuencialmente:
-   - **Actividad 1** (`DatabricksNotebook`): invoca el notebook `01_sentiment_analysis` en el clúster de Databricks, que lee el `.jsonl`, limpia los textos, aplica VADER para calcular el score de sentimiento de cada reseña y escribe el resultado en Parquet con compresión Snappy en el contenedor `processed-reviews`.
-   - **Actividad 2** (`Copy`): copia el Parquet generado a la tabla `dbo.reviews_sentiment` de Azure SQL Database.
-   - En caso de fallo de la actividad 1, una actividad de error llama al procedimiento almacenado `sp_log_pipeline_error` para registrar el fallo.
+5. El **dashboard Streamlit** consulta PostgreSQL cada 30 segundos y presenta KPIs, gráfico de barras por producto, distribución de sentimiento, serie temporal y mapa de países.
 
-6. El **notebook 02** (ejecutado a demanda o en cron) calcula agregaciones por producto, por hora y por país, escribiéndolas en tablas auxiliares de Azure SQL que el dashboard consulta.
-
-7. El **dashboard Streamlit** consulta Azure SQL cada 30 segundos y presenta KPIs, gráfico de barras por producto, serie temporal de sentimiento, mapa de calor por países y una tabla de las últimas 200 reseñas procesadas.
+6. **JupyterLab** está disponible en el puerto 8888 para ejecutar los notebooks interactivos de procesamiento y exploración, que implementan la misma lógica que los scripts de Airflow pero con visualización de resultados intermedios.
 
 ---
 
 ## 4. Explicación del desarrollo realizado
 
-### Persona 1 — Capa de ingesta (RabbitMQ)
+### Persona 1 — Capa de ingesta (RabbitMQ + Consumer)
 
-- Implementó el **Producer** (`producer/producer.py`) usando la biblioteca `pika` y `Faker` para generar reseñas sintéticas con distribución de ratings realista (sesgo hacia valoraciones altas).
+- Implementó el **Producer** (`producer/producer.py`) usando `pika` y `Faker` para generar reseñas sintéticas con distribución de ratings realista (sesgo hacia valoraciones altas).
 - Configuró las colas como **durables** y los mensajes como **persistentes** para garantizar que no se pierdan ante un reinicio del broker.
-- Implementó el **Consumer** (`consumer/consumer.py`) con un buffer thread-safe que acumula mensajes y hace flush por tamaño de lote o por timeout, subiendo ficheros `.jsonl` a Azure Blob Storage mediante la biblioteca `azure-storage-blob`.
-- El consumer sólo hace ACK a RabbitMQ **después** de confirmar la subida al blob, garantizando la consistencia "at-least-once" del pipeline.
-- Configuró el entorno Docker Compose con health checks para que los contenedores del producer y consumer esperen a que RabbitMQ esté listo antes de arrancar.
+- Implementó el **Consumer** (`consumer/consumer.py`) con un buffer thread-safe que acumula mensajes y hace flush por tamaño de lote o por timeout, subiendo ficheros `.jsonl` a MinIO mediante `boto3`.
+- Integró la llamada a la **REST API de Airflow** desde el consumer, replicando el comportamiento event-driven del Storage Event Trigger de ADF.
+- Configuró el entorno Docker Compose con health checks para que los servicios arranquen en el orden correcto.
 
-### Persona 2 — Capa de procesamiento y visualización (Azure)
+### Persona 2 — Capa de procesamiento y visualización
 
-- Diseñó el **esquema de base de datos** en Azure SQL con tablas de detalle, agregados y auditoría de errores (`sql/schema.sql`).
-- Configuró los **Linked Services, Datasets, Pipeline y Trigger** de Azure Data Factory (JSON en `adf/`) que conectan Blob Storage, Databricks y Azure SQL.
-- Desarrolló el **notebook 01** (`databricks/01_sentiment_analysis.ipynb`) en PySpark que lee el `.jsonl`, limpia los textos con una UDF, aplica VADER con otra UDF y escribe Parquet.
-- Desarrolló el **notebook 02** (`databricks/02_aggregations_dashboard.ipynb`) que agrega los datos históricos en tres dimensiones (producto, hora, país) y los escribe en Azure SQL vía JDBC.
-- Implementó el **dashboard Streamlit** (`dashboard/app.py`) con 4 KPIs, gráfico de barras interactivo (Plotly), gráfico de tarta de distribución de sentimiento, serie temporal y mapa de países.
+- Diseñó el **esquema de base de datos** en PostgreSQL con tablas de detalle, agregados y auditoría de errores (`sql/schema.sql`).
+- Configuró el **DAG de Airflow** (`airflow/dags/dag_reviews_etl.py`) con las dos tareas del pipeline y la gestión de errores mediante reintentos automáticos.
+- Desarrolló el **script de análisis de sentimiento** (`spark/sentiment_analysis.py`) en PySpark que lee el `.jsonl`, limpia los textos con UDFs, aplica VADER y escribe en PostgreSQL y MinIO.
+- Desarrolló el **script de agregaciones** (`spark/aggregations.py`) que calcula métricas en tres dimensiones (producto, hora, país) y las escribe en PostgreSQL.
+- Adaptó los **notebooks Jupyter** (`notebooks/`) para exploración interactiva equivalente a los notebooks originales de Databricks.
+- Implementó el **dashboard Streamlit** (`dashboard/app.py`) conectado a PostgreSQL mediante `psycopg2`.
 
 ---
 
@@ -108,12 +125,13 @@ Databricks es una plataforma de análisis de datos basada en Apache Spark. Se us
 
 _(Sustituir por capturas de pantalla reales)_
 
-- **Captura 1:** RabbitMQ Management UI mostrando la cola `reviews_queue` con mensajes en tránsito.
-- **Captura 2:** Azure Blob Storage con varios ficheros `.jsonl` en el contenedor `raw-reviews`.
-- **Captura 3:** Azure Data Factory — pipeline `pipeline_reviews_etl` con una ejecución exitosa (color verde).
-- **Captura 4:** Azure Databricks — output del notebook 01 con la distribución de sentimiento del lote.
-- **Captura 5:** Azure SQL Database — tabla `reviews_sentiment` con filas procesadas.
-- **Captura 6:** Dashboard Streamlit con KPIs, gráficas y mapa de países.
+- **Captura 1:** RabbitMQ Management UI (`http://localhost:15672`) mostrando la cola `reviews_queue` con mensajes en tránsito.
+- **Captura 2:** MinIO Console (`http://localhost:9001`) con varios ficheros `.jsonl` en el bucket `raw-reviews`.
+- **Captura 3:** Airflow UI (`http://localhost:8080`) — DAG `reviews_etl` con varias ejecuciones exitosas (estado verde).
+- **Captura 4:** Detalle de una ejecución del DAG mostrando las dos tareas (`sentiment_analysis` y `aggregations`) en verde.
+- **Captura 5:** JupyterLab con el notebook 01 mostrando la distribución de sentimiento del lote.
+- **Captura 6:** PostgreSQL — resultado de `SELECT COUNT(*), sentiment_label FROM reviews_sentiment GROUP BY sentiment_label`.
+- **Captura 7:** Dashboard Streamlit con KPIs, gráficas y mapa de países.
 
 ---
 
@@ -121,11 +139,12 @@ _(Sustituir por capturas de pantalla reales)_
 
 | Dificultad | Solución |
 |---|---|
-| El consumer hacía ACK antes de confirmar la subida al Blob, perdiendo mensajes si Azure fallaba | Se movió el ACK a RabbitMQ **después** de que `upload_blob()` completara sin excepción |
-| El Storage Event Trigger de ADF requiere una suscripción de eventos de Azure registrada en el Resource Provider | Registrar `Microsoft.EventGrid` en la suscripción de Azure desde el Portal |
-| VADER no analiza bien el español (fue entrenado en inglés) | Se añadió una nota en el notebook; para producción real se podría usar `pysentimiento` o traducir con Azure Cognitive Services |
-| Docker Compose arrancaba el producer antes de que RabbitMQ estuviera listo | Se añadió `healthcheck` al servicio RabbitMQ y `condition: service_healthy` en las dependencias |
-| El clúster de Databricks tardaba en arrancar (cold start ~5 min) | Se activó el modo "auto-terminate after 30 min" y se usó un clúster pre-arrancado para demos |
+| El consumer hacía ACK antes de confirmar la subida, perdiendo mensajes si MinIO fallaba | Se movió el ACK a RabbitMQ **después** de que `s3.put_object()` completara sin excepción |
+| El trigger event-driven de ADF (Storage Event Trigger) no tiene equivalente nativo en MinIO | Se implementó la llamada a la **REST API de Airflow** desde el consumer, manteniendo la arquitectura event-driven |
+| El Airflow webserver tarda en arrancar; el consumer intentaba activar el DAG antes de que estuviera listo | Se añadió `condition: service_healthy` en el `depends_on` del consumer hacia el webserver de Airflow |
+| VADER no analiza bien el español (fue entrenado en inglés) | Documentado como limitación; para producción real se recomendaría `pysentimiento` |
+| Docker Compose arrancaba servicios antes de que sus dependencias estuvieran listas | Se añadieron `healthcheck` a todos los servicios críticos y se usó `condition: service_healthy` / `service_completed_successfully` en los `depends_on` |
+| El schema.sql de T-SQL (Azure SQL) es incompatible con PostgreSQL | Se reescribió el DDL completo en sintaxis PostgreSQL (`VARCHAR`, `TIMESTAMP`, `SERIAL`, `NOW()`, sin `GO`) |
 
 ---
 
@@ -134,13 +153,13 @@ _(Sustituir por capturas de pantalla reales)_
 | Tarea | Persona 1 | Persona 2 |
 |---|---|---|
 | Producer (RabbitMQ) | ✓ | |
-| Consumer + bridge Azure | ✓ | |
+| Consumer + bridge MinIO + trigger Airflow | ✓ | |
 | Docker Compose | ✓ | |
-| Esquema Azure SQL | | ✓ |
-| Linked Services / Datasets ADF | | ✓ |
-| Pipeline y Trigger ADF | | ✓ |
-| Notebook 01 (sentimiento) | | ✓ |
-| Notebook 02 (agregaciones) | | ✓ |
+| Esquema PostgreSQL | | ✓ |
+| DAG de Airflow | | ✓ |
+| Script PySpark: sentiment_analysis | | ✓ |
+| Script PySpark: aggregations | | ✓ |
+| Notebooks Jupyter | | ✓ |
 | Dashboard Streamlit | | ✓ |
 | README y documentación | ✓ | ✓ |
 
@@ -149,11 +168,12 @@ _(Sustituir por capturas de pantalla reales)_
 ## 8. Conclusiones y posibles mejoras
 
 **Conclusiones:**  
-SentimentFlow demuestra cómo integrar un sistema de mensajería clásico como RabbitMQ con los servicios gestionados de Azure para construir un pipeline de datos robusto, escalable y con tolerancia a fallos. La combinación de ADF (orquestación) y Databricks (procesamiento) es habitual en arquitecturas Big Data empresariales.
+SentimentFlow demuestra cómo construir un pipeline de datos en tiempo casi-real con herramientas open-source sin depender de servicios cloud de pago. La arquitectura local es funcionalmente equivalente a la basada en Azure y facilita el desarrollo, las pruebas y la presentación del proyecto sin restricciones de créditos cloud.
 
 **Posibles mejoras:**
-- Sustituir el batch de 100 mensajes por **Azure Event Hubs** con procesamiento de Spark Structured Streaming para reducir la latencia a segundos.
-- Usar **Azure Cognitive Services (Text Analytics)** para un análisis de sentimiento multilingüe de mayor precisión.
-- Añadir una capa de **Data Quality** con Great Expectations antes de la escritura en SQL.
-- Desplegar la infraestructura con **Terraform** o **Bicep** para reproducibilidad.
-- Implementar alertas (Azure Monitor) cuando el sentimiento medio de un producto cae por debajo de un umbral.
+- Sustituir el batch de 100 mensajes por **Apache Kafka** con Spark Structured Streaming para latencia de segundos.
+- Usar **pysentimiento** (modelo entrenado en español/multilingüe) para mayor precisión en el análisis de sentimiento.
+- Añadir una capa de **Data Quality** con Great Expectations antes de la escritura en PostgreSQL.
+- Desplegar la infraestructura con **Docker Swarm** o **Kubernetes** para escalar horizontalmente.
+- Implementar alertas (Airflow callbacks + Slack) cuando el sentimiento medio de un producto cae por debajo de un umbral.
+- En entornos cloud reales, sustituir MinIO → S3/Azure Blob, PostgreSQL → RDS/Azure SQL, Airflow → MWAA/Cloud Composer, cambiando solo las variables de entorno.

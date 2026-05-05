@@ -31,25 +31,25 @@ def get_connection():
     )
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=10)
 def load_by_product() -> pd.DataFrame:
     conn = get_connection()
     return pd.read_sql("SELECT * FROM agg_by_product ORDER BY total_reviews DESC", conn)
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=10)
 def load_timeseries() -> pd.DataFrame:
     conn = get_connection()
     return pd.read_sql("SELECT * FROM agg_timeseries ORDER BY hour_bucket", conn)
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=10)
 def load_by_country() -> pd.DataFrame:
     conn = get_connection()
     return pd.read_sql("SELECT * FROM agg_by_country ORDER BY total_reviews DESC", conn)
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=10)
 def load_recent(n: int = 200) -> pd.DataFrame:
     conn = get_connection()
     return pd.read_sql(

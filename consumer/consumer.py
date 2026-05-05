@@ -180,7 +180,7 @@ def main():
     connection = connect_rabbitmq()
     channel = connection.channel()
     channel.queue_declare(queue=RABBITMQ_QUEUE, durable=True)
-    channel.basic_qos(prefetch_count=1)
+    channel.basic_qos(prefetch_count=BATCH_SIZE)
 
     def on_message(ch, method, _properties, body):
         try:
